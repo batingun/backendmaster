@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
-from datetime import datetime
+from datetime import datetime, date
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -17,7 +17,7 @@ app.add_middleware(
 
 CACHE = {"players": [], "last_updated": None, "status": "empty"}
 
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 HEADERS = {
     "x-rapidapi-host": "v3.football.api-sports.io",
     "x-rapidapi-key": RAPIDAPI_KEY,
@@ -29,84 +29,116 @@ LEAGUES = {
     "bundesliga": {"id": 78,  "season": 2024, "name": "Bundesliga", "flag": "🇩🇪"},
 }
 
-def map_status(type_str: str) -> str:
-    t = type_str.lower()
-    if any(x in t for x in ["suspended", "yellow", "red card"]): return "suspended"
-    if any(x in t for x in ["doubtful", "questionable"]):        return "doubtful"
+def map_status(type_str: str, reason_str: str) -> str:
+    combined = (type_str + " " + reason_str).lower()
+    if any(k in combined for k in ["suspended", "yellow cards", "yellow card", "red card", "suspension", "ban"]):
+        return "suspended"
+    if any(k in combined for k in ["doubtful", "questionable", "50/50"]):
+        return "doubtful"
     return "injured"
 
-async def fetch_league(league_key: str, info: dict) -> list:
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(
-            "https://v3.football.api-sports.io/injuries",
-            headers=HEADERS,
-            params={"league": info["id"], "season": info["season"]},
-        )
+async def fetch_league(league_key: str, league_info: dict) -> list:
+    url = "https://v3.football.api-sports.io/injuries"
+    params = {"league": league_info["id"], "season": league_info["season"]}
+    today = date.today()
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers=HEADERS, params=params)
         resp.raise_for_status()
         data = resp.json()
 
-    players, seen = [], set()
+    players = []
+    seen = set()
+
     for item in data.get("response", []):
-        p, t = item.get("player", {}), item.get("team", {})
-        key = f"{p.get('name')}_{t.get('name')}"
-        if key in seen: continue
+        player = item.get("player", {})
+        team   = item.get("team", {})
+        name      = player.get("name", "")
+        team_name = team.get("name", "")
+        type_str  = player.get("type", "")
+        reason    = player.get("reason", "")
+
+        # Deduplicate
+        key = f"{name}_{team_name}"
+        if key in seen:
+            continue
         seen.add(key)
+
+        # Return date
+        ret_raw = item.get("fixture", {}).get("date", "") if item.get("fixture") else ""
+        ret_date = ret_raw[:10] if ret_raw else ""
+
+        # Eski tarihleri filtrele: dönüş tarihi geçmişte ise gösterme
+        if ret_date:
+            try:
+                rd = date.fromisoformat(ret_date)
+                if rd < today:
+                    continue
+            except:
+                pass
+
+        status = map_status(type_str, reason)
+
         players.append({
-            "id":          f"{league_key}_{p.get('id')}",
-            "name":        p.get("name", ""),
-            "team":        t.get("name", ""),
+            "id":          f"{league_key}_{player.get('id')}",
+            "name":        name,
+            "team":        team_name,
             "league":      league_key,
-            "league_name": info["name"],
-            "league_flag": info["flag"],
-            "status":      map_status(p.get("type", "")),
-            "desc":        p.get("reason", "Bilinmiyor"),
-            "ret":         (item.get("fixture") or {}).get("date", "")[:10],
+            "league_name": league_info["name"],
+            "league_flag": league_info["flag"],
+            "status":      status,
+            "desc":        reason or type_str or "Bilinmiyor",
+            "ret":         ret_date,
         })
+
     return players
 
-async def fetch_all():
-    all_players, errors = [], []
+async def fetch_all() -> dict:
+    all_players = []
+    errors = []
+
     for key, info in LEAGUES.items():
         try:
             players = await fetch_league(key, info)
-            if len(players) < 3:
-                errors.append(f"{info['name']}: Az veri")
-            else:
-                all_players.extend(players)
-                print(f"✅ {info['name']}: {len(players)} oyuncu")
+            all_players.extend(players)
+            print(f"✅ {info['name']}: {len(players)} oyuncu")
         except Exception as e:
-            errors.append(f"{info['name']}: {e}")
+            errors.append(f"{info['name']}: {str(e)}")
             print(f"❌ {info['name']}: {e}")
 
-    if len(all_players) < 5:
+    if len(all_players) < 3:
         return {"status": "error", "message": "Yeterli veri gelmedi", "errors": errors}
 
     CACHE["players"]      = all_players
     CACHE["last_updated"] = datetime.now().strftime("%d %b %Y · %H:%M")
     CACHE["status"]       = "ok"
-    return {"status": "success", "updated": len(all_players), "errors": errors, "last_updated": CACHE["last_updated"]}
 
-# ── ENDPOINTS ──────────────────────────────────────────────────────────
-
-@app.get("/")
-def root():
-    return {"message": "Batingun Master Tool API çalışıyor 🟢", "players": len(CACHE["players"])}
+    return {
+        "status":       "success",
+        "updated":      len(all_players),
+        "errors":       errors,
+        "last_updated": CACHE["last_updated"],
+    }
 
 @app.get("/api/players")
 def get_players(league: str = None, team: str = None, status: str = None, q: str = None):
     players = CACHE["players"]
-    if league and league != "all":         players = [p for p in players if p["league"] == league]
-    if team and team != "Tüm Takımlar":   players = [p for p in players if p["team"] == team]
-    if status and status != "all":         players = [p for p in players if p["status"] == status]
+    if league and league != "all":
+        players = [p for p in players if p["league"] == league]
+    if team and team != "Tüm Takımlar":
+        players = [p for p in players if p["team"] == team]
+    if status and status != "all":
+        players = [p for p in players if p["status"] == status]
     if q:
         ql = q.lower()
         players = [p for p in players if ql in p["name"].lower() or ql in p["team"].lower()]
-    return {"players": players, "total": len(players), "last_updated": CACHE["last_updated"]}
+    return {"players": players, "total": len(players), "last_updated": CACHE["last_updated"], "cache_status": CACHE["status"]}
 
 @app.get("/api/teams")
 def get_teams(league: str = None):
     players = CACHE["players"]
-    if league and league != "all": players = [p for p in players if p["league"] == league]
+    if league and league != "all":
+        players = [p for p in players if p["league"] == league]
     return {"teams": sorted(set(p["team"] for p in players))}
 
 @app.post("/api/refresh")
@@ -116,13 +148,13 @@ async def manual_refresh():
 @app.get("/api/status")
 def get_status():
     counts = {}
-    for p in CACHE["players"]: counts[p["status"]] = counts.get(p["status"], 0) + 1
-    return {"total": len(CACHE["players"]), "counts": counts, "last_updated": CACHE["last_updated"]}
-
-# ── SCHEDULER ──────────────────────────────────────────────────────────
+    for p in CACHE["players"]:
+        counts[p["status"]] = counts.get(p["status"], 0) + 1
+    return {"total": len(CACHE["players"]), "counts": counts, "last_updated": CACHE["last_updated"], "status": CACHE["status"]}
 
 def scheduled_job():
     import asyncio
+    print("⏰ Otomatik güncelleme (Pazartesi 22:00)")
     asyncio.run(fetch_all())
 
 scheduler = BackgroundScheduler(timezone="Europe/Istanbul")
