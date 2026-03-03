@@ -51,33 +51,28 @@ async def fetch_league(league_key: str, league_info: dict) -> list:
     seen = set()
 
     for item in data.get("response", []):
-        player = item.get("player", {})
-        team   = item.get("team", {})
+        player    = item.get("player", {})
+        team      = item.get("team", {})
         name      = player.get("name", "")
         team_name = team.get("name", "")
         type_str  = player.get("type", "")
         reason    = player.get("reason", "")
 
-        # Deduplicate
         key = f"{name}_{team_name}"
         if key in seen:
             continue
         seen.add(key)
 
-        # Return date
-        ret_raw = item.get("fixture", {}).get("date", "") if item.get("fixture") else ""
+        ret_raw  = item.get("fixture", {}).get("date", "") if item.get("fixture") else ""
         ret_date = ret_raw[:10] if ret_raw else ""
 
-        # Eski tarihleri filtrele: dönüş tarihi geçmişte ise gösterme
+        # Dönüş tarihi geçmişte ise gösterme
         if ret_date:
             try:
-                rd = date.fromisoformat(ret_date)
-                if rd < today:
+                if date.fromisoformat(ret_date) < today:
                     continue
             except:
                 pass
-
-        status = map_status(type_str, reason)
 
         players.append({
             "id":          f"{league_key}_{player.get('id')}",
@@ -86,7 +81,7 @@ async def fetch_league(league_key: str, league_info: dict) -> list:
             "league":      league_key,
             "league_name": league_info["name"],
             "league_flag": league_info["flag"],
-            "status":      status,
+            "status":      map_status(type_str, reason),
             "desc":        reason or type_str or "Bilinmiyor",
             "ret":         ret_date,
         })
@@ -113,19 +108,14 @@ async def fetch_all() -> dict:
     CACHE["last_updated"] = datetime.now().strftime("%d %b %Y · %H:%M")
     CACHE["status"]       = "ok"
 
-    return {
-        "status":       "success",
-        "updated":      len(all_players),
-        "errors":       errors,
-        "last_updated": CACHE["last_updated"],
-    }
+    return {"status": "success", "updated": len(all_players), "errors": errors, "last_updated": CACHE["last_updated"]}
 
 @app.get("/api/players")
 def get_players(league: str = None, team: str = None, status: str = None, q: str = None):
     players = CACHE["players"]
     if league and league != "all":
         players = [p for p in players if p["league"] == league]
-    if team and team != "Tüm Takımlar":
+    if team and team not in ("Tüm Takımlar", "all"):
         players = [p for p in players if p["team"] == team]
     if status and status != "all":
         players = [p for p in players if p["status"] == status]
@@ -152,9 +142,13 @@ def get_status():
         counts[p["status"]] = counts.get(p["status"], 0) + 1
     return {"total": len(CACHE["players"]), "counts": counts, "last_updated": CACHE["last_updated"], "status": CACHE["status"]}
 
+@app.get("/")
+def root():
+    return {"message": "Batingun Master Tool API", "total": len(CACHE["players"]), "status": CACHE["status"]}
+
 def scheduled_job():
     import asyncio
-    print("⏰ Otomatik güncelleme (Pazartesi 22:00)")
+    print("⏰ Otomatik güncelleme başladı (Pazartesi 22:00)")
     asyncio.run(fetch_all())
 
 scheduler = BackgroundScheduler(timezone="Europe/Istanbul")
